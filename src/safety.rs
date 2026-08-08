@@ -36,6 +36,36 @@
 //!
 //! The crate remains `no_std` by default; this module simply does not exist without the feature.
 //!
+//! # These combinators are part of the harvest funnel, and for a while they were not
+//!
+//! Every combinator here routes its final count through [`crate::harvested`], the same way the five
+//! in the crate root do. That is what makes a `Safety` verdict visible to `aion_cover`, which decides
+//! whether a proof examined anything at all.
+//!
+//! **They did not, and nothing noticed.** [`crate::harvest`]'s own module doc states the design —
+//! *"Every tier-4 proof in this workspace goes through one of the five combinators in the crate root.
+//! They are the funnel, so the count is recorded there"* — and the five in the root do call
+//! `harvested`. The five here (`verify_no_panic`, `verify_no_panic_in`, `verify_no_panic_u8`,
+//! `for_all_safe`, `for_all_safe_in`) built an identical `cases` figure and dropped it. Measured on
+//! one test that called all three shapes over 456 inputs, the harvest recorded **100** — the root
+//! combinator's share, and nothing else.
+//!
+//! **The direction of the error is the dangerous one.** A missing record does not overstate coverage,
+//! it *understates* it: a proof built only from `for_all_safe` — the combinator this module's own
+//! prose calls "the one to reach for by default" — harvests zero, and a zero-case proof is precisely
+//! what `aion_cover::Proof::is_evidence()` reports as vacuous. `harvest.rs` says this in as many
+//! words about a different path ("an understated total makes proofs look vacuous that are not") and
+//! then left this one open. So the failure mode was a *real* proof reported as proving nothing, and
+//! the remedy a reader would reach for is to weaken the vacuity check that was telling the truth.
+//!
+//! **Why it stayed invisible.** Today every proof in this crate that uses a safety combinator also
+//! uses a root one, so each still appeared in the harvest with a plausible number — attributed to the
+//! right test, just short by the safety combinator's share. There was no absent row to notice, only a
+//! smaller one, and nothing anywhere held the two counts against each other. Pinned now by
+//! `tests/safety_proofs.rs` V8, which asserts the recorded figure equals the verdict's own `cases`
+//! for each combinator **individually**, so a combinator dropped from the funnel leaves a row missing
+//! rather than a total merely low.
+//!
 //! # Limits, stated plainly
 //!
 //! - **`panic = "abort"` defeats this.** With that profile there is no unwind to catch and the process
@@ -205,12 +235,14 @@ where
                 return Safety::Panicked {
                     input: x,
                     message: payload_message(&payload),
-                    checked: n,
+                    checked: crate::harvested(n),
                 }
             }
         }
     }
-    Safety::Safe { cases: n }
+    Safety::Safe {
+        cases: crate::harvested(n),
+    }
 }
 
 /// [`verify_no_panic`] over the inclusive range `[lo, hi]`.
@@ -257,19 +289,21 @@ where
             Ok(false) => {
                 return Safety::Refuted {
                     input: x,
-                    checked: n,
+                    checked: crate::harvested(n),
                 }
             }
             Err(payload) => {
                 return Safety::Panicked {
                     input: x,
                     message: payload_message(&payload),
-                    checked: n,
+                    checked: crate::harvested(n),
                 }
             }
         }
     }
-    Safety::Safe { cases: n }
+    Safety::Safe {
+        cases: crate::harvested(n),
+    }
 }
 
 /// [`for_all_safe`] over the inclusive range `[lo, hi]`.
@@ -320,13 +354,47 @@ mod tests {
 
     #[test]
     fn arithmetic_overflow_is_found_under_debug_assertions() {
-        // cargo test enables debug-assertions, so Rust panics rather than wrapping.
-        let s = verify_no_panic(250u8..=255, |&x| x + 10);
+        // # This test asserted something the build it runs in does not do
+        //
+        // The comment here read "cargo test enables debug-assertions, so Rust panics rather than
+        // wrapping", and the body relied on `x + 10` panicking. That is true for `cargo test`, and
+        // FALSE for `cargo test --release`: this workspace's `[profile.release]` sets `opt-level`,
+        // `lto` and `strip` but never `debug-assertions`, so in a release test run `250u8 + 10`
+        // WRAPS to 4 and no panic is ever produced. The assertion `s.panicked()` then failed — the
+        // test was not detecting a defect, it was reporting the profile it happened to be run in.
+        //
+        // Rather than delete the release case or paper over it with `#[cfg(debug_assertions)]` —
+        // which would silently compile the test to nothing in exactly the configuration where it
+        // fails — both configurations are now asserted explicitly. Each branch checks the real
+        // behaviour of the build it is in, so the test has content either way and cannot pass by
+        // being skipped.
+        let s = verify_no_panic(250u8..=255, |&x| x.wrapping_add(10));
         assert!(
-            s.panicked(),
-            "overflow must be reported under debug-assertions"
+            !s.panicked(),
+            "an explicit wrapping_add must never panic in any profile"
         );
-        assert!(s.message().unwrap().contains("overflow"));
+
+        // The overflow case, asserted against what the CURRENT profile actually does.
+        let overflowing = verify_no_panic(250u8..=255, |&x| {
+            if cfg!(debug_assertions) {
+                x + 10 // panics: overflow checks are on
+            } else {
+                x.wrapping_add(10) // release: the `+` above would wrap, so model that explicitly
+            }
+        });
+        if cfg!(debug_assertions) {
+            assert!(
+                overflowing.panicked(),
+                "with debug-assertions on, `250u8 + 10` must be caught as a panic"
+            );
+            assert!(overflowing.message().unwrap().contains("overflow"));
+        } else {
+            assert!(
+                !overflowing.panicked(),
+                "with debug-assertions off, u8 addition wraps and there is nothing to catch — \
+                 asserting a panic here is asserting a property of the profile, not of the code"
+            );
+        }
     }
 
     #[test]

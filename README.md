@@ -1,3 +1,23 @@
+<!--
+  WHY THIS FILE DIFFERS FROM THE COPY IN THE AION OS WORKSPACE — read before "reconciling" it.
+
+  `aion_verify` exists in two places: the copy inside the private AION OS workspace, and this one,
+  which is published to crates.io. `src/**` is IDENTICAL between them modulo rustfmt — verified by
+  formatting both with `rustfmt --edition 2021` and diffing, which produces byte-identical files.
+  (The published crate's CI gates on `cargo fmt --all --check`; the workspace does not, so the two
+  differ in whitespace and in nothing else. A drift check should compare formatted forms.)
+
+  This README does NOT match the in-workspace one, on purpose. That one is a short internal note for
+  people who already have the whole workspace in front of them. This one is the crate's front page on
+  crates.io and docs.rs: it has to explain the engine to somebody who has never seen AION, be honest
+  about what the engine cannot do, and say where Kani is still the better tool. Replacing it with the
+  internal note would be a regression for every downloader, so the divergence is deliberate and this
+  comment is the record of it.
+
+  `tests/connection.rs` and `tests/grouping.rs` also differ deliberately; the reason is written at the
+  top of each of those files.
+-->
+
 # aion_verify
 
 [![crates.io](https://img.shields.io/crates/v/aion_verify.svg)](https://crates.io/crates/aion_verify)
@@ -137,6 +157,41 @@ The `safety` module needs `features = ["std"]` and an unwinding panic profile (`
 leaves nothing to catch). It raises the crate MSRV to **1.81** when enabled. The crate is `no_std`
 with zero dependencies by default, unchanged.
 
+## Proving *another crate's* invariants — and running that proof yourself
+
+The claim worth testing about a proof engine is not that it agrees with itself. It is that you can
+point it at ordinary code, written without it in mind, and have it establish — or refute, *with a
+witness* — that code's invariants over the whole of a finite domain.
+
+`tests/connection.rs` and `tests/grouping.rs` do exactly that, against
+**[`aion_verify_subject`](https://crates.io/crates/aion_verify_subject)**: a tiny published
+access-control domain (badges, roles, clearances, wings, revocation) that has **zero dependencies —
+including no dependency on `aion_verify`**. The arrow runs one way only.
+
+```console
+$ cargo test --test connection --test grouping
+```
+
+Four invariants, each by complete coverage rather than sampling:
+
+| Invariant | Domain | Cases |
+| --- | --- | --- |
+| A role granted exactly one clearance holds that one **and no other** | `Clearance::ALL` | 10 |
+| Covering one wing never covers another | `Wing × Wing` | 144 |
+| A revoked badge holds **no** clearance | `Clearance::ALL` | 10 |
+| A badge never issued holds nothing | `Clearance::ALL` | 10 |
+
+The first one is the one worth dwelling on. The obvious authorization test — *grant `c`, assert the
+holder may do `c`* — **cannot fail in the direction that matters**, because it never looks at what
+leaked. The proof here ranges over the whole `Clearance` domain and asserts
+`may(badge, x) == (x == granted)` for every `x`.
+
+> **Before 3.9.0 these two tests existed but could not be published.** Their subject was a private
+> crate reached as a `path` dev-dependency, and `cargo publish` strips path-only dev-dependencies —
+> so the two tests that demonstrate the entire point of the engine were exactly the two nobody
+> outside could compile. `aion_verify_subject` is the fix: published separately, depended on **by
+> version**, resolvable by everybody.
+
 ## What this still is not
 
 Two real gaps remain against a compiler-driven checker like Kani:
@@ -150,6 +205,22 @@ Two real gaps remain against a compiler-driven checker like Kani:
 It complements Kani; it does not replace it.
 
 ## Tier 5 — symbolic proofs over *unbounded* domains (`symbolic` module)
+
+**Tier 5 is this crate, not a different one.** It is worth being exact about what that does and does
+not mean, because "we do tier 5 too" is the kind of claim that quietly stops being true:
+
+- `symbolic` proves properties over **unbounded** integer domains — all 2^64 values of a `u64`, over
+  any number of variables — without enumerating them.
+- It is **sound but incomplete**. Every transfer function over-approximates, so the answer is
+  `Proven`, `Refuted` *with a concrete witness*, or an honest **`Unknown`** when the abstraction is
+  too imprecise to decide. It never returns a false `Proven` and never a false `Refuted`.
+- `Unknown` is not rare or hypothetical: relational and correlated properties — where the same
+  variable appears more than once, so the interval domain loses the correlation between its
+  occurrences — routinely land there. Branch-and-bound refinement and the affine layer recover many
+  of them; not all.
+- **An SMT-based checker such as Kani/CBMC decides cases this returns `Unknown` on.** That is the
+  honest summary of the relationship: Kani is a *stronger independent second opinion*, not something
+  this replaces.
 
 Tier 4 enumerates, so it needs a finite domain. Tier 5 proves properties over the **entire** domain —
 including all 2^64 values of `u64` — **without enumerating it**, by interval abstract interpretation.

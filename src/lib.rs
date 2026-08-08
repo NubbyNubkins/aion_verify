@@ -1,44 +1,41 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 //! AION OS — first-party proof engine (`aion_verify`).
 //!
-//! It checks a predicate against **every** input in a bounded domain and returns a [`Verdict`] of either
-//! `Proven { cases }` (complete coverage — a proof) or `Refuted` **with the counterexample** that broke
-//! it. Over that domain the guarantee is the real thing: not a sample, the whole space.
+//! Checks a predicate against **every** input in a bounded domain, returning a [`Verdict`] of either
+//! `Proven { cases }` (complete coverage — a proof) or `Refuted` **with the counterexample**. Over that
+//! domain the guarantee is the real thing: not a sample, the whole space.
 //!
 //! # Automatic properties — not just the predicate you write
 //!
-//! A bounded model checker like Kani verifies properties you never stated: index-out-of-bounds,
-//! arithmetic overflow, `unwrap` on `None`, division by zero. Those follow from the language, not from
-//! anything the author asserted. Two modules cover that ground here, by different routes:
+//! A bounded model checker verifies properties nobody stated: index-out-of-bounds, arithmetic
+//! overflow, `unwrap` on `None`, division by zero. Two modules cover that here:
 //!
-//! - [`safety::verify_no_panic`] runs the code over every input in a bounded domain and catches any
-//!   unwind. Rust already emits those checks as panics, so exhaustive execution proves no input in the
-//!   domain can panic. Requires the `std` feature and an unwinding profile.
-//! - [`symbolic::prove_no_overflow`] answers the same question *symbolically*, over unbounded domains
-//!   and independent of the build profile — which matters because Rust only panics on integer overflow
-//!   under `debug-assertions`, and wraps silently in release.
+//! - [`safety::verify_no_panic`] (needs the `std` feature) runs the code over every input and catches
+//!   any unwind. Rust already emits those checks as panics, so exhaustive execution proves none fire.
+//! - [`symbolic::prove_no_overflow`] answers the same question symbolically, over unbounded domains
+//!   and independent of the build profile — Rust only panics on integer overflow under
+//!   `debug-assertions` and wraps silently in release.
 //!
 //! # What this still is not
 //!
-//! Two real gaps remain against a compiler-driven checker, and they are worth stating plainly:
+//! - **This crate does not read your code — but `aion_vlift` now does.** Tier 4 executes a closure
+//!   you pass it, and tier 5 analyses an [`symbolic::Expr`]. Historically that `Expr` was always
+//!   built BY HAND, and a model that drifts from the implementation proves things about the model,
+//!   not the code — measured, not theorised: six defects induced in `aion_caps` were caught by its
+//!   hand-written concrete anchors and by NONE of its hand-written symbolic contracts.
 //!
-//! - **It does not read your code.** Kani compiles actual Rust MIR and reasons about the program as
-//!   written. Tier 4 here executes a closure you hand it; tier 5 analyses an [`symbolic::Expr`] you
-//!   build by hand. Modelling a function as an `Expr` is manual work, and a model that drifts from the
-//!   implementation proves things about the model, not the code.
+//!   `crates/aion_vlift` closes that for a narrow-but-real subset: it lifts an `Expr` out of
+//!   `rustc --emit=mir` (through `aion_vmir`'s CFG), so what the engine proves IS the function body.
+//!   It covers unsigned-scalar arithmetic, bitwise ops, comparisons, branching and early returns,
+//!   and it REFUSES by name — never silently — everything else (signed integers, floats, structs,
+//!   references, calls, loops, projections). The engine itself deliberately keeps no dependency on
+//!   it: `aion_verify` stays `no_std` with zero normal dependencies, and the MIR parser lives one
+//!   crate away.
 //! - **It only covers code that is reached.** Tier 4 covers exactly the paths the enumerated inputs
-//!   take, and cannot see a function nobody called. Kani, being compiler-driven, has no such limit.
+//!   take, and cannot see a function nobody called.
 //!
-//! Also inherent to the approach: concrete enumeration cannot span astronomically large domains (tier 5
-//! exists for that, at the cost of `Unknown` answers where the interval abstraction loses precision),
-//! and a passing verdict can still be hollow — see [`Verdict::is_vacuous`].
-//!
-//! So `aion_verify` is the everyday, zero-dependency engine for bounded invariants and automatic
-//! arithmetic safety, and **Kani remains the independent, third-party formal check**. It complements
-//! Kani; it does not replace it.
+//! Concrete enumeration also cannot span astronomically large domains (tier 5 exists for that, at the
+//! cost of honest `Unknown` answers), and a passing verdict can still be hollow — see
+//! [`Verdict::is_vacuous`]. **Kani (tier 5) remains the independent, third-party proof.**
 //!
 //! `no_std`, `#![forbid(unsafe_code)]`.
 #![forbid(unsafe_code)]
@@ -46,27 +43,39 @@
 
 extern crate alloc;
 
+/// Tamper-evident SHA-512 hash-chain proof ledger.
+pub mod ledger;
+/// Merkle (XMSS-style) many-time signatures over WOTS.
+pub mod mss;
+/// Post-quantum WOTS one-time signatures (hash-based).
+pub mod pqsig;
+/// Symbolic verification over large/unbounded domains (interval + affine relational + branch-and-bound
+/// refinement + inductive invariants) — Phases A–G, the tier-5 companion to the tier-4 enumerator.
+pub mod symbolic;
+
 /// Automatic safety checking — panics (index-out-of-bounds, overflow, `unwrap`, division by zero)
 /// found without writing a predicate, the way a bounded model checker does. Requires the `std`
 /// feature. See [`safety`].
 #[cfg(feature = "std")]
 pub mod safety;
 
-/// TIER 5 — symbolic verification over unbounded domains (interval abstract interpretation). Proves
-/// properties over *all* of `u64` without enumerating it, entirely in first-party Rust. See [`symbolic`].
-pub mod symbolic;
+/// Runtime harvesting of `cases` — the figure a proof produces that its source does not contain, and
+/// the one `aion_cover` needs to tell a real proof from a vacuous one. Requires the `std` feature and
+/// an environment variable; inert otherwise. See [`harvest`].
+#[cfg(feature = "std")]
+pub mod harvest;
 
-/// A tamper-evident, append-only hash-chain [`ledger`] (with a pure-Rust SHA-512) for recording proof
-/// results so they cannot be forged or silently deleted.
-pub mod ledger;
-
-/// Post-quantum authenticity: a hash-based (WOTS) [`pqsig`] signature over the ledger head, so the log
-/// is provably yours and immune to Shor's algorithm — using only SHA-512, still zero-dependency.
-pub mod pqsig;
-
-/// Many-time post-quantum signatures: a Merkle tree ([`mss`], XMSS-style) over the one-time WOTS, so
-/// one published root signs `2^height` proofs from a single key.
-pub mod mss;
+/// Record a combinator's case count, when harvesting is on. A no-op in every `no_std` build — the
+/// kernel-side users of this crate compile this to nothing.
+///
+/// Deliberately NOT inside the combinators' hot loops: one call per combinator invocation, carrying
+/// the total, so an enabled harvest cannot change the cost of a proof by more than a constant.
+#[inline]
+fn harvested(cases: u64) -> u64 {
+    #[cfg(feature = "std")]
+    harvest::record(cases);
+    cases
+}
 
 /// The outcome of a proof attempt over a domain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,56 +89,60 @@ pub enum Verdict<T> {
 impl<T> Verdict<T> {
     /// True when the predicate was never refuted.
     ///
-    /// **Caution — this is true for a vacuous proof.** A `Proven { cases: 0 }` verdict means the
-    /// predicate was never actually evaluated, because the domain was empty or a precondition filtered
-    /// every input out. Prefer [`is_proven_nonvacuous`](Self::is_proven_nonvacuous) in assertions.
+    /// **Caution — this is also true for a vacuous proof.** `Proven { cases: 0 }` means nothing was
+    /// ever checked. Prefer [`is_proven_nonvacuous`](Self::is_proven_nonvacuous) in assertions.
     pub fn is_proven(&self) -> bool {
         matches!(self, Verdict::Proven { .. })
     }
 
     /// True when the verdict is `Proven` but **zero inputs were checked** — a vacuous proof.
     ///
-    /// This is the classic vacuity problem from model checking. `for_all_where(inputs, precond, pred)`
-    /// reports `Proven` when `precond` rejected every input: nothing was tested, so nothing was proven,
-    /// yet the verdict reads as success. The usual cause is a precondition that over-constrains — an
-    /// `assume` that is stricter than the author believed, or that contradicts the domain outright.
-    ///
-    /// ```
-    /// use aion_verify::for_all_where;
-    /// // No u8 satisfies both `x > 200` and `x < 100`, so nothing is ever checked.
-    /// // `black_box` hides the contradiction from the optimizer and the linter.
-    /// let hi = core::hint::black_box(100u8);
-    /// let v = for_all_where(0u8..=255, |&x| x > 200 && x < hi, |_| false);
-    /// assert!(v.is_proven(), "reads as success...");
-    /// assert!(v.is_vacuous(), "...but proves nothing -- note the predicate is literally `false`");
-    /// assert!(!v.is_proven_nonvacuous());
-    /// ```
+    /// The classic vacuity problem: [`for_all_where`] reports `Proven` when its precondition rejected
+    /// every input, so the verdict reads as success while nothing was tested. This is how a proof suite
+    /// silently stops proving anything — a precondition drifts out of sync with its domain and the tests
+    /// stay green.
     pub fn is_vacuous(&self) -> bool {
         matches!(self, Verdict::Proven { cases: 0 })
     }
 
-    /// [`is_proven`](Self::is_proven) with the vacuity hole closed: the predicate held **and** at least
-    /// one input actually reached it. This is what a test assertion should use.
+    /// [`is_proven`](Self::is_proven) plus the requirement that at least one input actually reached the
+    /// predicate. This is what a tier-4 proof should assert on.
     ///
+    /// Catches an *empty domain*, not a *trivial predicate*: `|x: i8| x <= 127` is true by the type's
+    /// own range and proves nothing, but enumeration cannot tell it apart from a real property. Guard
+    /// against that by comparing to an independently computed reference value.
+    ///
+    /// # It is also blind to a predicate that declines the input itself
+    ///
+    /// `cases` counts inputs the predicate **returned `true` for**, and an input the predicate walked
+    /// away from returns `true` just like one it examined:
+    ///
+    /// ```ignore
+    /// for_all_in(0, 1000, |x| {
+    ///     if !interesting(x) { return true; }   // <- counted as a case; nothing was checked
+    ///     real_property(x)
+    /// })
     /// ```
-    /// use aion_verify::for_all_in;
-    /// let v = for_all_in(0, 100, |x| x <= 100);
-    /// assert!(v.is_proven_nonvacuous());
-    /// ```
     ///
-    /// # What this does not catch
+    /// The verdict reads `Proven { cases: 1001 }` at any level of `interesting`, including none at
+    /// all. No count can distinguish those skips from work — the skip happens on the far side of the
+    /// combinator, where the engine cannot see it. That is the same defect as
+    /// [`is_vacuous`](Self::is_vacuous) one layer in, and this predicate is structurally unable to
+    /// catch it.
     ///
-    /// Vacuity comes in two forms, and only one is detectable from outside the predicate:
+    /// A survey of this workspace counted **31 such early exits across 23 `proofs.rs` files**. They
+    /// have since been migrated to the deciding combinators below and **none remain**; the only bare
+    /// `return true;` left in any `tests/*.rs` is the deliberate demonstration in `vacuity_proofs.rs`,
+    /// which exists to keep measuring the gap. The migration was not bookkeeping — it found that
+    /// three proofs were reporting between 17% and 86% of their case counts as skips, and that one
+    /// 40,000-case proof would have read `Proven { cases: 40000 }` with its engine proving nothing.
     ///
-    /// - **Empty domain** — nothing was checked. Decidable; this method catches it.
-    /// - **Trivial predicate** — plenty was checked, but the predicate cannot fail. `|x: i8| x <= 127`
-    ///   is true by the type's own range, so it proves nothing about the code under test. No amount of
-    ///   enumeration distinguishes a trivially-true property from a hard-won one, so this is *not*
-    ///   detectable here. Guard against it by writing predicates that compare against an independently
-    ///   computed reference value, or by confirming the proof fails when the implementation is mutated.
+    /// [`for_all_deciding`] closes it: a predicate returning `Option<bool>` says `None` for an input
+    /// it declines, so the skip crosses back into the engine and is counted separately.
     pub fn is_proven_nonvacuous(&self) -> bool {
         matches!(self, Verdict::Proven { cases } if *cases > 0)
     }
+
     /// Inputs examined (all of them on Proven; the ones that passed before the failure on Refuted).
     pub fn cases(&self) -> u64 {
         match self {
@@ -156,24 +169,18 @@ where
         if !pred(&x) {
             return Verdict::Refuted {
                 counterexample: x,
-                checked: n,
+                checked: harvested(n),
             };
         }
         n += 1;
     }
-    Verdict::Proven { cases: n }
+    Verdict::Proven {
+        cases: harvested(n),
+    }
 }
 
 /// Like [`for_all`] but only over inputs satisfying `precond` — the equivalent of a `kani::assume` guard.
 /// Proves `pred` on every input where the precondition holds.
-///
-/// # Vacuity warning
-///
-/// If `precond` rejects every input, this returns `Proven { cases: 0 }` — a **vacuous** proof that
-/// reads as success while having tested nothing. This is the most common way a proof suite silently
-/// stops proving anything: a precondition drifts out of sync with the domain, and every test still
-/// passes. Assert with [`Verdict::is_proven_nonvacuous`] rather than [`Verdict::is_proven`], or check
-/// [`Verdict::cases`] against the count you expect.
 pub fn for_all_where<I, T, P, F>(inputs: I, precond: P, pred: F) -> Verdict<T>
 where
     I: IntoIterator<Item = T>,
@@ -188,12 +195,17 @@ where
         if !pred(&x) {
             return Verdict::Refuted {
                 counterexample: x,
-                checked: n,
+                checked: harvested(n),
             };
         }
         n += 1;
     }
-    Verdict::Proven { cases: n }
+    // The vacuity case this crate exists to expose — a precondition that rejected every input —
+    // records a genuine ZERO here, which is exactly what `aion_cover` must see. Skipping the record
+    // when `n == 0` would make a vacuous proof indistinguishable from one that never ran.
+    Verdict::Proven {
+        cases: harvested(n),
+    }
 }
 
 /// Exhaustive proof over the entire `u8` domain (all 256 values).
@@ -219,13 +231,216 @@ pub fn for_all_pairs<A: Clone, B: Clone, F: Fn(&A, &B) -> bool>(
             if !pred(x, y) {
                 return Verdict::Refuted {
                     counterexample: (x.clone(), y.clone()),
-                    checked: n,
+                    checked: harvested(n),
                 };
             }
             n += 1;
         }
     }
-    Verdict::Proven { cases: n }
+    Verdict::Proven {
+        cases: harvested(n),
+    }
+}
+
+/// The outcome of a proof whose predicate is allowed to **decline** an input.
+///
+/// See [`for_all_deciding`] for why this type exists. The short version: `Verdict::Proven { cases }`
+/// counts inputs the predicate returned `true` for, which includes every input it returned `true` for
+/// *without looking at*. Here the two are separate numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deciding<T> {
+    /// The verdict over the inputs the predicate actually decided. `cases` is the DECIDED count.
+    pub verdict: Verdict<T>,
+    /// Inputs the predicate declined by returning `None`. Enumerated, never examined.
+    pub skipped: u64,
+}
+
+impl<T> Deciding<T> {
+    /// Inputs the predicate actually decided (and that held, on a `Proven` verdict).
+    pub fn decided(&self) -> u64 {
+        self.verdict.cases()
+    }
+
+    /// Inputs the predicate declined.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Inputs drawn from the domain: decided plus declined.
+    ///
+    /// On a `Refuted` verdict the refuting input is neither — it is reported as the counterexample —
+    /// so this is the count of inputs that came back without a refutation.
+    pub fn enumerated(&self) -> u64 {
+        self.decided().saturating_add(self.skipped)
+    }
+
+    /// True when the predicate was never refuted **and it decided at least one input**.
+    ///
+    /// This is the assertion [`Verdict::is_proven_nonvacuous`] cannot make: a proof whose predicate
+    /// declined every input reports `skipped = n, decided = 0` and is refused here, where the plain
+    /// combinator would have reported `Proven { cases: n }` and passed.
+    pub fn is_proven_nonvacuous(&self) -> bool {
+        self.verdict.is_proven_nonvacuous()
+    }
+
+    /// True when the verdict is `Proven` but nothing was decided — every input was declined, or the
+    /// domain was empty.
+    pub fn is_vacuous(&self) -> bool {
+        self.verdict.is_vacuous()
+    }
+
+    pub fn is_proven(&self) -> bool {
+        self.verdict.is_proven()
+    }
+
+    pub fn counterexample(&self) -> Option<&T> {
+        self.verdict.counterexample()
+    }
+}
+
+/// Prove `pred` over every input it is willing to DECIDE, and count the ones it declines.
+///
+/// `pred` returns `Some(true)` (held), `Some(false)` (refuted, with this input as the counterexample)
+/// or `None` (declined — out of scope for this property).
+///
+/// # The hole this closes
+///
+/// [`for_all_where`] takes the precondition as a separate closure, so the engine sees the filtering
+/// and records a genuine zero when it admits nothing. A predicate that filters *internally* —
+///
+/// ```ignore
+/// for_all(inputs, |x| {
+///     let Some(parsed) = parse(x) else { return true };   // declined, counted as a case
+///     parsed.is_canonical()
+/// })
+/// ```
+///
+/// — hides the filtering behind a `true`, and no `cases` figure can recover it. The proof reads as
+/// healthy at any skip rate, up to and including 100%, and [`Verdict::is_proven_nonvacuous`] is
+/// structurally blind to it: the skip and the pass are the same value by the time the engine sees
+/// them. This is not hypothetical — 31 such early exits sat across 23 `proofs.rs` files in this
+/// workspace, since migrated to this combinator and its two siblings. Measured on the way through:
+/// `aion_verify`'s own A10 reported 40,000 cases and had decided 5,467 of them.
+///
+/// Written as `Option<bool>`, the decline crosses back into the engine and becomes a number.
+///
+/// The **harvest records the decided count, not the enumerated one**, so `aion_cover` sees the honest
+/// figure: a proof that declined everything confers no coverage, which is exactly what it earned.
+///
+/// ```
+/// use aion_verify::for_all_deciding;
+///
+/// // Only even inputs are in scope for this property.
+/// let d = for_all_deciding(0u64..=99, |&x| (x % 2 == 0).then(|| x % 2 == 0));
+/// assert!(d.is_proven_nonvacuous());
+/// assert_eq!(d.decided(), 50);
+/// assert_eq!(d.skipped(), 50);
+///
+/// // A predicate that declines EVERYTHING is refused, where a bare `return true` would have passed.
+/// let empty = for_all_deciding(0u64..=99, |_| None::<bool>);
+/// assert!(empty.is_vacuous());
+/// assert!(!empty.is_proven_nonvacuous());
+/// assert_eq!(empty.skipped(), 100);
+/// ```
+pub fn for_all_deciding<I, T, F>(inputs: I, pred: F) -> Deciding<T>
+where
+    I: IntoIterator<Item = T>,
+    F: Fn(&T) -> Option<bool>,
+{
+    let mut decided = 0u64;
+    let mut skipped = 0u64;
+    for x in inputs {
+        match pred(&x) {
+            Some(true) => decided += 1,
+            None => skipped += 1,
+            Some(false) => {
+                return Deciding {
+                    verdict: Verdict::Refuted {
+                        counterexample: x,
+                        checked: harvested(decided),
+                    },
+                    skipped,
+                }
+            }
+        }
+    }
+    // The DECIDED count is harvested, deliberately: `aion_cover` asks "did this proof examine
+    // anything", and a declined input is the exact case where the answer is no.
+    Deciding {
+        verdict: Verdict::Proven {
+            cases: harvested(decided),
+        },
+        skipped,
+    }
+}
+
+/// [`for_all_deciding`] over the inclusive range `[lo, hi]` — the deciding form of [`for_all_in`].
+///
+/// Exists so migrating a proof off a bare `return true;` is a change of two tokens rather than a
+/// change of shape. `for_all_in` is the combinator 22 of this workspace's 31 internal early exits sit
+/// inside, and a migration that also has to restructure the domain expression is one that gets
+/// deferred.
+///
+/// ```
+/// use aion_verify::for_all_in_deciding;
+///
+/// // Only multiples of three are in scope; the other two thirds are declined, not passed.
+/// let d = for_all_in_deciding(0, 29, |x| (x % 3 == 0).then_some(x % 3 == 0));
+/// assert!(d.is_proven_nonvacuous());
+/// assert_eq!((d.decided(), d.skipped(), d.enumerated()), (10, 20, 30));
+/// ```
+pub fn for_all_in_deciding<F: Fn(u64) -> Option<bool>>(lo: u64, hi: u64, pred: F) -> Deciding<u64> {
+    for_all_deciding(lo..=hi, |&x| pred(x))
+}
+
+/// [`for_all_deciding`] over the cartesian product of two finite domains — the deciding form of
+/// [`for_all_pairs`].
+///
+/// The pair combinator needs its own deciding form for a reason beyond convenience: a pair proof's
+/// most common early exit is the DIAGONAL (`if a == b { return true; }`) or an ordering guard
+/// (`if i >= j { return true; }`), which declines between a half and all-but-`n` of the product. Those
+/// are the skips most likely to be mistaken for work, because the enumerated figure — `n²` — looks
+/// impressive while the decided figure may be a fraction of it.
+///
+/// ```
+/// use aion_verify::for_all_pairs_deciding;
+///
+/// let xs = [0u32, 1, 2, 3];
+/// // Only ordered pairs say anything; the diagonal and the reverse are declined.
+/// let d = for_all_pairs_deciding(&xs, &xs, |&a, &b| (a < b).then(|| a < b));
+/// assert_eq!((d.decided(), d.skipped(), d.enumerated()), (6, 10, 16));
+/// assert!(d.is_proven_nonvacuous());
+/// ```
+pub fn for_all_pairs_deciding<A: Clone, B: Clone, F: Fn(&A, &B) -> Option<bool>>(
+    a: &[A],
+    b: &[B],
+    pred: F,
+) -> Deciding<(A, B)> {
+    let mut decided = 0u64;
+    let mut skipped = 0u64;
+    for x in a {
+        for y in b {
+            match pred(x, y) {
+                Some(true) => decided += 1,
+                None => skipped += 1,
+                Some(false) => {
+                    return Deciding {
+                        verdict: Verdict::Refuted {
+                            counterexample: (x.clone(), y.clone()),
+                            checked: harvested(decided),
+                        },
+                        skipped,
+                    }
+                }
+            }
+        }
+    }
+    Deciding {
+        verdict: Verdict::Proven {
+            cases: harvested(decided),
+        },
+        skipped,
+    }
 }
 
 #[cfg(test)]
@@ -237,62 +452,6 @@ mod tests {
         let v = for_all_u8(|x| (x as u16) + 1 > x as u16);
         assert!(v.is_proven());
         assert_eq!(v.cases(), 256, "every u8 checked — a proof, not a sample");
-    }
-
-    #[test]
-    fn vacuous_proofs_are_flagged_when_a_precondition_filters_everything_out() {
-        // The predicate is `false` -- it could never hold for any input. But the precondition is
-        // unsatisfiable, so the predicate is never reached and the verdict reads as Proven.
-        // `black_box` keeps the contradiction opaque to the optimizer and to clippy, which would
-        // otherwise reject `x > 200 && x < 100` as a comparison that can never be true -- correct in
-        // general, and exactly the situation being tested here.
-        let hi = core::hint::black_box(100u8);
-        let v = for_all_where(0u8..=255, |&x| x > 200 && x < hi, |_| false);
-
-        assert!(v.is_proven(), "the legacy check reports success");
-        assert_eq!(v.cases(), 0, "because nothing was ever checked");
-        assert!(
-            v.is_vacuous(),
-            "which is exactly what is_vacuous exists to surface"
-        );
-        assert!(
-            !v.is_proven_nonvacuous(),
-            "and the safe assertion refuses it"
-        );
-    }
-
-    #[test]
-    fn an_empty_domain_is_vacuous_too() {
-        // Not just preconditions: any empty input iterator yields the same hollow Proven.
-        let v: Verdict<u64> = for_all_in(10, 0, |_| false);
-        assert!(v.is_vacuous(), "lo > hi means an empty range");
-        assert!(!v.is_proven_nonvacuous());
-    }
-
-    #[test]
-    fn a_real_proof_is_nonvacuous() {
-        let v = for_all_u8(|x| (x as u16) + 1 > x as u16);
-        assert!(
-            v.is_proven_nonvacuous(),
-            "256 inputs actually reached the predicate"
-        );
-        assert!(!v.is_vacuous());
-
-        // A satisfiable precondition still leaves witnesses behind.
-        let w = for_all_where(0u8..=255, |&x| x % 2 == 0, |&x| x % 2 == 0);
-        assert!(w.is_proven_nonvacuous());
-        assert_eq!(w.cases(), 128);
-    }
-
-    #[test]
-    fn refuted_verdicts_are_never_vacuous() {
-        // A counterexample is proof the predicate was reached, so vacuity cannot apply.
-        let v = for_all_u8(|x| x < 200);
-        assert!(!v.is_vacuous());
-        assert!(
-            !v.is_proven_nonvacuous(),
-            "refuted is not proven, vacuous or otherwise"
-        );
     }
 
     #[test]

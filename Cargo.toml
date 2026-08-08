@@ -1,10 +1,10 @@
 [package]
 name = "aion_verify"
-version = "3.8.0"
+version = "3.9.0"
 edition = "2021"
 rust-version = "1.81"
 license = "MPL-2.0"
-description = "A pure-Rust proof stack with no dependencies and no external solver. Tier 4 exhaustively checks a predicate over a bounded domain; tier 5 proves properties over UNBOUNDED, multi-variable domains via interval abstract interpretation, branch-and-bound refinement, and affine relational reasoning, with function contracts. Also finds faults you never wrote a predicate for -- index-out-of-bounds, overflow, unwrap, division by zero -- by exhaustive execution (std) or symbolically (profile-independent). Plus a tamper-evident SHA-512 hash-chain ledger and post-quantum (hash-based WOTS/Merkle) signatures. no_std, no unsafe."
+description = "A pure-Rust proof stack with no dependencies and no external solver. Tier 4 exhaustively checks a predicate over a bounded domain: Proven{cases} over EVERY input, or Refuted with the counterexample. Tier 5 is the same crate, not a different one -- `symbolic` proves properties over UNBOUNDED multi-variable integer domains (all 2^64 values of a u64, without enumerating them) by interval abstract interpretation, branch-and-bound refinement, affine relational reasoning and inductive invariants, with function contracts. It is SOUND BUT INCOMPLETE: it answers Proven, Refuted with a concrete witness, or an honest Unknown when the abstraction is too imprecise to decide -- typically relational or correlated properties -- and never a false Proven or Refuted. An SMT-based checker such as Kani/CBMC decides cases this returns Unknown on, so Kani remains a stronger independent second opinion rather than something this replaces. Also finds faults you never wrote a predicate for -- index-out-of-bounds, overflow, unwrap, division by zero -- by exhaustive execution (std) or symbolically (profile-independent). Plus a tamper-evident SHA-512 hash-chain ledger and post-quantum (hash-based WOTS/Merkle) signatures. no_std, no unsafe."
 repository = "https://github.com/NubbyNubkins/aion_verify"
 documentation = "https://docs.rs/aion_verify"
 readme = "README.md"
@@ -14,10 +14,24 @@ categories = ["development-tools::testing", "no-std", "algorithms"]
 [features]
 # no_std by default -- unchanged. The `std` feature adds the `safety` module, which catches panics
 # (index-out-of-bounds, overflow, unwrap, division by zero) automatically. Needs std for catch_unwind.
+# It also adds `harvest`, which needs std::fs.
 default = []
 std = []
 
 [dependencies]
+
+# The engine's most interesting claim is that it proves ANOTHER crate's invariants, not its own -- and
+# for three years' worth of releases that claim shipped with no test a downloader could run, because
+# the only subject was a private crate reached by PATH and `cargo publish` strips path-only
+# dev-dependencies. `aion_verify_subject` is that subject, published so `tests/connection.rs` and
+# `tests/grouping.rs` resolve for everybody.
+#
+# BOTH `version` and `path` are given on purpose. `path` is what a local checkout of the two repos
+# side by side builds against; `version` is what `cargo publish` keeps after stripping the path, so
+# the shipped crate depends on a real registry release. Publish `aion_verify_subject` FIRST -- a
+# publish of this crate against an unpublished dependency is rejected.
+[dev-dependencies]
+aion_verify_subject = { version = "1.0.0", path = "../aion_verify_subject" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

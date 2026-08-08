@@ -125,25 +125,53 @@ fn refutes_a_false_contract_with_a_witness() {
     }
 }
 
+// The three tests below used to state their claims about `(x >> 1) <= x`. As of 3.9.0 the interval
+// domain's shift rules are precise enough to decide that one outright — see
+// `the_shift_rules_now_decide_what_they_once_could_not` immediately below — so continuing to assert
+// `Unknown` for it would have pinned an imprecision that no longer exists, and quietly turned three
+// soundness tests into tests of nothing.
+//
+// They now use `x * x >= x` over `[0, 1000]`, which is TRUE for every value in the domain and which
+// the non-relational domain genuinely cannot see: it treats the two occurrences of `x` as
+// independent, computes `[0,1000] * [0,1000] = [0, 1_000_000]`, and can conclude neither
+// `0 >= 1000` nor `1_000_000 < 0`. The claims are unchanged and the subject is harder.
+
+/// The property the three tests below used to be written against, kept as a fact in its own right:
+/// the shift rules now decide it, where before they returned `Unknown`.
+#[test]
+fn the_shift_rules_now_decide_what_they_once_could_not() {
+    // `(x >> 1) <= x` over ALL 2^64 values of u64, from the plain interval domain, no refinement.
+    // This is an improvement, not a relaxation: a decision replaced an abstention. It is asserted
+    // here so that a future regression in `shr_iv` shows up as a failure rather than as a quiet
+    // return to `Unknown` that nothing was watching.
+    let p = Prop::Le(Expr::var().shr(1), Expr::var());
+    assert_eq!(prove_forall(Iv::full(), &p), SymVerdict::Proven);
+}
+
 #[test]
 fn honest_unknown_never_a_false_result() {
-    // (x >> 1) <= x is TRUE for every u64 — but a NON-relational interval domain loses the correlation
-    // between `x >> 1` and `x`, and no probed value breaks it. So the engine says Unknown, NOT a false
-    // Proven and NOT a false Refuted. Soundness over bravado.
-    let p = Prop::Le(Expr::var().shr(1), Expr::var());
-    assert_eq!(prove_forall(Iv::full(), &p), SymVerdict::Unknown);
+    // `x * x >= x` is TRUE for every x in [0,1000] — but a NON-relational interval domain loses the
+    // correlation between the two occurrences of `x`, and no probed value breaks it. So the engine
+    // says Unknown, NOT a false Proven and NOT a false Refuted. Soundness over bravado.
+    let p = Prop::Ge(Expr::var_at(0).mul(Expr::var_at(0)), Expr::var_at(0));
+    assert_eq!(prove_forall(Iv::new(0, 1000), &p), SymVerdict::Unknown);
+    // And it really is true everywhere in the domain — so the `Unknown` above is imprecision, not a
+    // property that happens to be false. Without this, "Unknown" would be unfalsifiable.
+    for x in 0u64..=1000 {
+        assert!(x * x >= x, "x={x}");
+    }
 }
 
 // ── Phase C — interval refinement (branch-and-bound) proves correlated properties ──────────────────
 
 #[test]
 fn refinement_proves_a_correlated_property() {
-    // (x >> 1) <= x is TRUE for all u64 but CORRELATED — prove_forall_n gives Unknown (see the test
-    // above). With refinement (bisecting the domain) it becomes a real proof over all 2^64 values.
-    let p = Prop::Le(Expr::var().shr(1), Expr::var());
-    assert_eq!(prove_forall_n(&[Iv::full()], &p), SymVerdict::Unknown); // plain interval: undecided
+    // `x * x >= x` is TRUE for all x in [0,1000] but CORRELATED — prove_forall_n gives Unknown (see
+    // the test above). With refinement (bisecting the domain) it becomes a real proof.
+    let p = Prop::Ge(Expr::var_at(0).mul(Expr::var_at(0)), Expr::var_at(0));
+    assert_eq!(prove_forall_n(&[Iv::new(0, 1000)], &p), SymVerdict::Unknown); // plain interval: undecided
     assert_eq!(
-        prove_forall_refine(&[Iv::full()], &p, 256),
+        prove_forall_refine(&[Iv::new(0, 1000)], &p, 256),
         SymVerdict::Proven
     ); // refinement: proven
 }
@@ -164,10 +192,17 @@ fn refinement_refutes_a_false_correlation() {
 fn refinement_is_honest_when_the_budget_runs_out() {
     // With too small a split budget it cannot finish the proof — and must say Unknown, never a false
     // Proven. Soundness holds regardless of budget.
-    let p = Prop::Le(Expr::var().shr(1), Expr::var());
+    let p = Prop::Ge(Expr::var_at(0).mul(Expr::var_at(0)), Expr::var_at(0));
     assert_eq!(
-        prove_forall_refine(&[Iv::full()], &p, 2),
+        prove_forall_refine(&[Iv::new(0, 1000)], &p, 2),
         SymVerdict::Unknown
+    );
+    // The same property, same domain, a budget that suffices: Proven. Both halves are asserted so
+    // that "Unknown at budget 2" cannot pass because the property is simply undecidable at any
+    // budget — which would make the honesty claim vacuous.
+    assert_eq!(
+        prove_forall_refine(&[Iv::new(0, 1000)], &p, 256),
+        SymVerdict::Proven
     );
 }
 

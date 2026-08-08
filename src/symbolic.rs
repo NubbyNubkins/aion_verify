@@ -69,6 +69,36 @@ impl Iv {
         self.lo <= v && v <= self.hi
     }
 
+    /// Whether this interval denotes the **empty set** — `lo > hi`, so no value is inside it.
+    ///
+    /// # Why an interval can be empty at all, when `new` swaps
+    ///
+    /// [`new`](Iv::new) normalises, but `lo` and `hi` are **public fields**, so `Iv { lo: 5, hi: 3 }`
+    /// is ordinary Rust that any caller can write — most often by transposing the two arguments of a
+    /// bound they computed. Nothing rejected it, and the arithmetic below assumed `lo <= hi`
+    /// throughout:
+    ///
+    /// * [`refine`] computed the split width as `d.hi - d.lo`, which **underflow-panics under
+    ///   `debug-assertions` and wraps to a near-`u64::MAX` width in a release build** — after which
+    ///   `d.lo + (d.hi - d.lo) / 2` overflows in turn;
+    /// * `Iv::shl` guards on `self.hi` and then shifts `self.lo`, so an inverted interval passes the
+    ///   guard on the small end and **overflow-panics on the large one**;
+    /// * `prove_forall_n` reported `Refuted { witness: [d.lo] }` for a domain containing no
+    ///   assignments at all — a witness the caller's domain excludes.
+    ///
+    /// That is the same shape as the `Affine` overflow this crate already carries a note about: a
+    /// proof engine whose answer depends on the optimisation level, on an input a caller is entitled
+    /// to construct. The public entry points now refuse an empty box rather than reason over it —
+    /// see [`prove_forall_n`].
+    pub const fn is_empty(&self) -> bool {
+        self.lo > self.hi
+    }
+
+    /// The canonical empty interval.
+    pub const fn empty() -> Iv {
+        Iv { lo: 1, hi: 0 }
+    }
+
     fn add(self, o: Iv) -> Iv {
         match (self.lo.checked_add(o.lo), self.hi.checked_add(o.hi)) {
             (Some(lo), Some(hi)) => Iv { lo, hi },
@@ -105,9 +135,16 @@ impl Iv {
         }
     }
     fn shr(self, k: u32) -> Iv {
-        if k >= 64 {
-            return Iv::point(0);
-        }
+        // The shift amount is MASKED, not saturated. [`Expr::eval_at`] evaluates `Shr` with
+        // `u64::wrapping_shr`, which discards the high bits of `k` and shifts by `k % 64` — so
+        // `x >> 64` is `x`, not zero.
+        //
+        // This line previously returned `Iv::point(0)` for `k >= 64`, which is an
+        // UNDER-approximation: the interval [0, 0] does not contain the value the expression
+        // actually takes. That is the one direction the abstraction may never go, and it made
+        // `prove_forall_n(&[Iv::point(5)], &Prop::Eq(Expr::var().shr(64), Expr::c(0)))` return
+        // `Proven` for a property that is false at the only point of its domain.
+        let k = k % 64;
         Iv {
             lo: self.lo >> k,
             hi: self.hi >> k,
@@ -117,9 +154,35 @@ impl Iv {
         let hi = if mask < self.hi { mask } else { self.hi };
         Iv { lo: 0, hi }
     }
+    /// Bitwise OR with a CONSTANT mask.
+    ///
+    /// # Why this delegates rather than keeping its own bound
+    ///
+    /// This used to return `Iv { lo: max(mask, self.lo), hi: u64::MAX }` — sound, but it discarded
+    /// the upper bound entirely, even when the operand was tightly bounded. The two-variable
+    /// [`Iv::bitor_iv`] already computed the correct bit-saturation bound, so the CONSTANT case —
+    /// the more informative one, since one side is known exactly — was strictly LESS precise than
+    /// the variable case on identical input:
+    ///
+    /// ```text
+    ///   x in [0,1], x | 1  via bitor      -> [1, u64::MAX]     (no upper bound at all)
+    ///   x in [0,1], x | 1  via bitor_iv   -> [1, 1]            (exact)
+    /// ```
+    ///
+    /// The cost was real and measured, not hypothetical. `rustc` lowers `x | 1` to a constant-mask
+    /// `Or`, so every lifted function containing an OR-with-literal hit the weak path: the contract
+    /// `x <= 1 -> (x | 1) <= 1` came back `Unknown` from the lifted MIR while the identical goal
+    /// written by hand with `OrE` came back `Proven`. A property that is provable when typed by a
+    /// human and unprovable when read from the compiler is precisely the asymmetry the lifter exists
+    /// to remove.
+    ///
+    /// # Soundness
+    ///
+    /// Unchanged in direction — this only ever NARROWS the returned interval, and it narrows to a
+    /// bound already proven sound for the two-interval case. A constant `mask` is the point interval
+    /// `[mask, mask]`, so delegating is exact, not an approximation of an approximation.
     fn bitor(self, mask: u64) -> Iv {
-        let lo = if mask > self.lo { mask } else { self.lo };
-        Iv { lo, hi: u64::MAX }
+        self.bitor_iv(Iv::point(mask))
     }
     fn rem(self, m: u64) -> Iv {
         if m == 0 {
@@ -129,6 +192,114 @@ impl Iv {
             self
         } else {
             Iv { lo: 0, hi: m - 1 }
+        }
+    }
+
+    /// Bitwise AND of two intervals — the variable-by-variable case.
+    ///
+    /// # Why this is not `bitand`'s job
+    ///
+    /// [`Iv::bitand`] masks by a CONSTANT and is the only bitwise form the engine had, because
+    /// [`Expr::And`] carries a `u64` rather than a second `Expr`. That was a real expressiveness
+    /// wall, and it had a measured cost: `Cap::attenuate` computes `rights & keep` over two
+    /// *variables*, so the one function whose defect this crate most wanted to catch could not be
+    /// written down.
+    ///
+    /// # Soundness
+    ///
+    /// For unsigned values, `a & b <= a` and `a & b <= b` — clearing bits can only decrease the
+    /// value. So `hi = min(a.hi, b.hi)` is a sound upper bound. The lower bound is `0`: whenever the
+    /// two operands have no bits in common the result is `0`, and interval endpoints alone cannot
+    /// rule that out. Widening downward is always legal; narrowing is what would be unsound.
+    fn bitand_iv(self, o: Iv) -> Iv {
+        Iv {
+            lo: 0,
+            hi: if self.hi < o.hi { self.hi } else { o.hi },
+        }
+    }
+
+    /// Bitwise OR of two intervals — the variable-by-variable case.
+    ///
+    /// # Soundness
+    ///
+    /// `a | b >= a` and `a | b >= b` (setting bits can only increase the value), so
+    /// `lo = max(a.lo, b.lo)` is sound. For the upper bound, `a | b <= a + b` would overflow, so this
+    /// uses the standard bit-saturation bound: take `max(a.hi, b.hi)` and set every bit below its
+    /// highest set bit. That value is `>= a | b` for any `a <= a.hi`, `b <= b.hi`, because `a | b`
+    /// cannot have a set bit above the highest set bit of either operand's maximum, and every bit at
+    /// or below that position is already set in the bound.
+    fn bitor_iv(self, o: Iv) -> Iv {
+        let lo = if self.lo > o.lo { self.lo } else { o.lo };
+        let m = if self.hi > o.hi { self.hi } else { o.hi };
+        // Saturate every bit below m's highest set bit. `m == 0` means both maxima are 0, and the
+        // only possible result is 0.
+        let hi = if m == 0 {
+            0
+        } else {
+            // Smear the highest set bit downward: 0b0100.. -> 0b0111..
+            let mut s = m;
+            s |= s >> 1;
+            s |= s >> 2;
+            s |= s >> 4;
+            s |= s >> 8;
+            s |= s >> 16;
+            s |= s >> 32;
+            s
+        };
+        // The smeared bound is >= lo by construction (hi >= m >= max(a.hi,b.hi) >= max(a.lo,b.lo)),
+        // but an inverted input interval could break that, so normalise rather than emit an empty
+        // interval that would read as "no values".
+        if lo > hi {
+            Iv::full()
+        } else {
+            Iv { lo, hi }
+        }
+    }
+
+    /// Bitwise XOR of two intervals.
+    ///
+    /// # Soundness
+    ///
+    /// XOR is neither monotone up nor down: `a ^ b` can be `0` (when `a == b`) and can be as large as
+    /// the OR bound. So the lower bound is `0` and the upper bound is the same bit-saturation bound
+    /// [`bitor_iv`](Iv::bitor_iv) uses — `a ^ b <= a | b` for all `a, b`, so the OR bound covers XOR.
+    fn bitxor_iv(self, o: Iv) -> Iv {
+        Iv {
+            lo: 0,
+            hi: self.bitor_iv(o).hi,
+        }
+    }
+
+    /// Left shift by a variable amount.
+    ///
+    /// The shift amount is masked to `k % 64`, matching [`Expr::eval_at`]'s `wrapping_shl`. Any
+    /// non-zero shift can lose bits off the top, so unless the shift amount is provably `0` this
+    /// widens to the full domain — sound, and honest about how little an interval knows here.
+    fn shl_iv(self, k: Iv) -> Iv {
+        if k.lo == 0 && k.hi == 0 {
+            return self;
+        }
+        Iv::full()
+    }
+
+    /// Right shift by a variable amount.
+    ///
+    /// Shifting right is monotone in the value and anti-monotone in the amount, and the amount is
+    /// masked to `[0, 63]`. So the smallest result is `lo >> 63` (largest legal shift of the smallest
+    /// value) and the largest is `hi >> (smallest possible shift)`.
+    fn shr_iv(self, k: Iv) -> Iv {
+        // When the amount's interval spans 64 or more values every masked amount 0..=63 is possible,
+        // so the smallest shift that can occur is 0.
+        let (kmin, kmax) = if k.hi.wrapping_sub(k.lo) >= 63 || k.hi >= 64 {
+            (0u32, 63u32)
+        } else {
+            ((k.lo % 64) as u32, (k.hi % 64) as u32)
+        };
+        // Guard the ordering: if masking inverted the pair, fall back to the widest legal range.
+        let (kmin, kmax) = if kmin <= kmax { (kmin, kmax) } else { (0, 63) };
+        Iv {
+            lo: self.lo >> kmax,
+            hi: self.hi >> kmin,
         }
     }
 }
@@ -154,6 +325,26 @@ pub enum Expr {
     Or(Box<Expr>, u64),
     /// Remainder by a constant modulus.
     Rem(Box<Expr>, u64),
+
+    // ── variable-by-variable bitwise and shift ────────────────────────────────────────────────────
+    //
+    // ADDED, NOT REPLACING: `And`/`Or`/`Shl`/`Shr` above carry a CONSTANT and every existing caller
+    // and proof keeps working unchanged. These are the forms real code produces that the constant
+    // versions could not express — `rights & keep` in `Cap::attenuate` being the motivating case,
+    // where BOTH sides are function parameters. Without them the one function the tier-5 exercise
+    // most wanted to check could not be written down at all, which is why `aion_caps`'
+    // `tier5_symbolic_proofs.rs` records "THERE IS NO VARIABLE-BY-VARIABLE `AND`" as a stated
+    // limitation rather than a property.
+    /// Bitwise AND of two expressions.
+    AndE(Box<Expr>, Box<Expr>),
+    /// Bitwise OR of two expressions.
+    OrE(Box<Expr>, Box<Expr>),
+    /// Bitwise XOR of two expressions.
+    XorE(Box<Expr>, Box<Expr>),
+    /// Left shift by a variable amount (masked to `k % 64`, matching `wrapping_shl`).
+    ShlE(Box<Expr>, Box<Expr>),
+    /// Right shift by a variable amount (masked to `k % 64`, matching `wrapping_shr`).
+    ShrE(Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -192,6 +383,26 @@ impl Expr {
     pub fn rem(self, m: u64) -> Expr {
         Expr::Rem(Box::new(self), m)
     }
+    /// Bitwise AND with another **expression** (as opposed to [`Expr::and`]'s constant mask).
+    pub fn and_e(self, o: Expr) -> Expr {
+        Expr::AndE(Box::new(self), Box::new(o))
+    }
+    /// Bitwise OR with another expression.
+    pub fn or_e(self, o: Expr) -> Expr {
+        Expr::OrE(Box::new(self), Box::new(o))
+    }
+    /// Bitwise XOR with another expression.
+    pub fn xor_e(self, o: Expr) -> Expr {
+        Expr::XorE(Box::new(self), Box::new(o))
+    }
+    /// Left shift by a variable amount.
+    pub fn shl_e(self, o: Expr) -> Expr {
+        Expr::ShlE(Box::new(self), Box::new(o))
+    }
+    /// Right shift by a variable amount.
+    pub fn shr_e(self, o: Expr) -> Expr {
+        Expr::ShrE(Box::new(self), Box::new(o))
+    }
 
     /// Substitute every variable by its next-state expression: `Var(i)` becomes `next[i]`. This is how a
     /// transition system's step is applied to an invariant (turn `inv(state)` into `inv(next_state)`).
@@ -207,6 +418,11 @@ impl Expr {
             Expr::And(a, m) => Expr::And(Box::new(a.subst(next)), *m),
             Expr::Or(a, m) => Expr::Or(Box::new(a.subst(next)), *m),
             Expr::Rem(a, m) => Expr::Rem(Box::new(a.subst(next)), *m),
+            Expr::AndE(a, b) => Expr::AndE(Box::new(a.subst(next)), Box::new(b.subst(next))),
+            Expr::OrE(a, b) => Expr::OrE(Box::new(a.subst(next)), Box::new(b.subst(next))),
+            Expr::XorE(a, b) => Expr::XorE(Box::new(a.subst(next)), Box::new(b.subst(next))),
+            Expr::ShlE(a, b) => Expr::ShlE(Box::new(a.subst(next)), Box::new(b.subst(next))),
+            Expr::ShrE(a, b) => Expr::ShrE(Box::new(a.subst(next)), Box::new(b.subst(next))),
         }
     }
 
@@ -225,6 +441,11 @@ impl Expr {
             Expr::And(a, m) => a.eval_iv(doms).bitand(*m),
             Expr::Or(a, m) => a.eval_iv(doms).bitor(*m),
             Expr::Rem(a, m) => a.eval_iv(doms).rem(*m),
+            Expr::AndE(a, b) => a.eval_iv(doms).bitand_iv(b.eval_iv(doms)),
+            Expr::OrE(a, b) => a.eval_iv(doms).bitor_iv(b.eval_iv(doms)),
+            Expr::XorE(a, b) => a.eval_iv(doms).bitxor_iv(b.eval_iv(doms)),
+            Expr::ShlE(a, b) => a.eval_iv(doms).shl_iv(b.eval_iv(doms)),
+            Expr::ShrE(a, b) => a.eval_iv(doms).shr_iv(b.eval_iv(doms)),
         }
     }
 
@@ -247,6 +468,12 @@ impl Expr {
                     a.eval_at(xs) % *m
                 }
             }
+            Expr::AndE(a, b) => a.eval_at(xs) & b.eval_at(xs),
+            Expr::OrE(a, b) => a.eval_at(xs) | b.eval_at(xs),
+            Expr::XorE(a, b) => a.eval_at(xs) ^ b.eval_at(xs),
+            // Wrapping, to match the constant-shift arms above and `Iv::shl_iv`/`Iv::shr_iv`.
+            Expr::ShlE(a, b) => a.eval_at(xs).wrapping_shl(b.eval_at(xs) as u32),
+            Expr::ShrE(a, b) => a.eval_at(xs).wrapping_shr(b.eval_at(xs) as u32),
         }
     }
 }
@@ -341,7 +568,28 @@ impl Prop {
             Prop::And(p, q) => p.eval_iv(doms).and(q.eval_iv(doms)),
             Prop::Or(p, q) => p.eval_iv(doms).or(q.eval_iv(doms)),
             Prop::Not(p) => p.eval_iv(doms).negate(),
-            Prop::Implies(p, q) => p.eval_iv(doms).negate().or(q.eval_iv(doms)),
+            // `P -> Q` is `!P || Q`. Evaluating both sides over intervals treats the two
+            // occurrences of a SHARED sub-proposition as independent, so the tautology `P -> P`
+            // comes back `Unknown`: `Unknown.negate().or(Unknown)` is `Unknown`.
+            //
+            // That is not a corner case, it is the ordinary shape of a lifted verification goal. A
+            // function lifted from MIR produces one guarded case per path, and
+            // `LiftedFn::postcondition` builds `guard -> claim`; whenever the property being checked
+            // is the branch condition the compiler itself tested — which is exactly what
+            // `if held & req == req` does — the goal IS `P -> P`. Before this rule the engine
+            // returned `Unknown` for the CORRECT function, and a verdict that is `Unknown` for both
+            // the correct and the corrupted version distinguishes nothing at all.
+            //
+            // Sound because it is a propositional tautology, decided structurally and never against
+            // the abstraction: `entails(p, q)` answers `true` only when `q` is syntactically `p` or a
+            // conjunct of it, in which case `p -> q` holds in every model.
+            Prop::Implies(p, q) => {
+                if entails(p, q) {
+                    Tri::True
+                } else {
+                    p.eval_iv(doms).negate().or(q.eval_iv(doms))
+                }
+            }
         }
     }
 
@@ -376,50 +624,67 @@ impl Prop {
 // integer one. Anything else (Sub, Shr, And, Or, Rem, var·var) is not affine here and falls back to
 // the interval comparison — never an unsound shortcut.
 
-/// A linear form `c + Σ coeffs[(var, coeff)]` over `i128` (wide enough that sums/differences of u64
-/// magnitudes never overflow).
+/// A linear form `c + Σ coeffs[(var, coeff)]` over `i128`.
+///
+/// # `i128` is wide enough for one u64 magnitude, not for a product of them
+///
+/// Sums and differences of u64-sized quantities fit here with room to spare. **Products of
+/// coefficients do not.** `to_affine` multiplies a coefficient by a constant on every `Mul`-by-const
+/// and by `1 << k` on every `Shl`, so a nested expression like `(x * u64::MAX) * u64::MAX` asks for a
+/// coefficient of `(2^64 - 1)^2 ≈ 3.4e38`, and `i128::MAX ≈ 1.7e38`.
+///
+/// That is not a precision question, it is a soundness one, and it went both ways at once:
+///
+/// * under `debug-assertions` the multiplication **panicked** — the proof engine crashing on an
+///   ordinary expression a caller is entitled to hand it;
+/// * in a release build it **wrapped**, and a wrapped coefficient is negative, so `bounds` reported a
+///   maximum of `0` for a form whose true values are positive. `cmp_le_full` read `a - b <= 0`
+///   everywhere and `prove_forall_n` returned **`Proven` for a property that is false at x = 1**.
+///
+/// So every operation below is checked and returns `None` on overflow. `to_affine` already returns
+/// `Option`, and its `None` means "not in the linear fragment — fall back to the interval domain",
+/// which is always sound. An affine form that cannot be represented is exactly that case.
 struct Affine {
     c: i128,
     coeffs: Vec<(u32, i128)>,
 }
 
 impl Affine {
-    fn add(mut self, o: Affine) -> Affine {
-        self.c += o.c;
+    fn add(mut self, o: Affine) -> Option<Affine> {
+        self.c = self.c.checked_add(o.c)?;
         for (v, k) in o.coeffs {
             match self.coeffs.iter_mut().find(|(vv, _)| *vv == v) {
-                Some(e) => e.1 += k,
+                Some(e) => e.1 = e.1.checked_add(k)?,
                 None => self.coeffs.push((v, k)),
             }
         }
-        self
+        Some(self)
     }
-    fn scale(mut self, s: i128) -> Affine {
-        self.c *= s;
+    fn scale(mut self, s: i128) -> Option<Affine> {
+        self.c = self.c.checked_mul(s)?;
         for e in self.coeffs.iter_mut() {
-            e.1 *= s;
+            e.1 = e.1.checked_mul(s)?;
         }
-        self
+        Some(self)
     }
-    fn neg(self) -> Affine {
+    fn neg(self) -> Option<Affine> {
         self.scale(-1)
     }
     /// The (min, max) of this form over the variable domains, exact in `i128`.
-    fn bounds(&self, doms: &[Iv]) -> (i128, i128) {
+    ///
+    /// `None` when the exact value does not fit — the caller must then decline affine reasoning
+    /// rather than proceed on a wrapped figure.
+    fn bounds(&self, doms: &[Iv]) -> Option<(i128, i128)> {
         let mut lo = self.c;
         let mut hi = self.c;
         for &(v, k) in &self.coeffs {
             let d = doms.get(v as usize).copied().unwrap_or_else(Iv::full);
             let (dl, dh) = (d.lo as i128, d.hi as i128);
-            if k >= 0 {
-                lo += k * dl;
-                hi += k * dh;
-            } else {
-                lo += k * dh;
-                hi += k * dl;
-            }
+            let (klo, khi) = if k >= 0 { (dl, dh) } else { (dh, dl) };
+            lo = lo.checked_add(k.checked_mul(klo)?)?;
+            hi = hi.checked_add(k.checked_mul(khi)?)?;
         }
-        (lo, hi)
+        Some((lo, hi))
     }
 }
 
@@ -434,18 +699,18 @@ fn to_affine(e: &Expr) -> Option<Affine> {
             c: *v as i128,
             coeffs: Vec::new(),
         }),
-        Expr::Add(a, b) => Some(to_affine(a)?.add(to_affine(b)?)),
+        Expr::Add(a, b) => to_affine(a)?.add(to_affine(b)?),
         Expr::Mul(a, b) => {
             let (af, bf) = (to_affine(a)?, to_affine(b)?);
             if af.coeffs.is_empty() {
-                Some(bf.scale(af.c))
+                bf.scale(af.c)
             } else if bf.coeffs.is_empty() {
-                Some(af.scale(bf.c))
+                af.scale(bf.c)
             } else {
                 None // var·var is non-linear
             }
         }
-        Expr::Shl(a, k) if *k < 63 => Some(to_affine(a)?.scale(1i128 << k)),
+        Expr::Shl(a, k) if *k < 63 => to_affine(a)?.scale(1i128 << k),
         // Sub can go negative (u64 wrap); Shr/And/Or/Rem are non-linear — fall back to intervals.
         _ => None,
     }
@@ -457,10 +722,172 @@ fn affine_diff(a: &Expr, b: &Expr, doms: &[Iv]) -> Option<(i128, i128)> {
     let (af, bf) = (to_affine(a)?, to_affine(b)?);
     const MAX: i128 = u64::MAX as i128;
     // No overflow in computing either operand (both are ≥ 0 by construction of the fragment).
-    if af.bounds(doms).1 > MAX || bf.bounds(doms).1 > MAX {
+    // A `None` from `bounds` is an unrepresentable form, and declines affine reasoning for the same
+    // reason an over-MAX bound does: the u64 value would not equal the integer value.
+    if af.bounds(doms)?.1 > MAX || bf.bounds(doms)?.1 > MAX {
         return None;
     }
-    Some(af.add(bf.neg()).bounds(doms)) // bounds of (a - b)
+    af.add(bf.neg()?)?.bounds(doms) // bounds of (a - b)
+}
+
+/// Structural equality of two expressions — "these are syntactically the same term".
+///
+/// Used only to recognise the shared operand in a bitwise dominance law (`x & y <= x`). It is
+/// deliberately conservative: two expressions that are equal in value but written differently
+/// (`x + 0` vs `x`) answer `false`, which costs precision and never soundness.
+fn same_expr(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Var(i), Expr::Var(j)) => i == j,
+        (Expr::Const(x), Expr::Const(y)) => x == y,
+        (Expr::Add(a1, a2), Expr::Add(b1, b2))
+        | (Expr::Sub(a1, a2), Expr::Sub(b1, b2))
+        | (Expr::Mul(a1, a2), Expr::Mul(b1, b2))
+        | (Expr::AndE(a1, a2), Expr::AndE(b1, b2))
+        | (Expr::OrE(a1, a2), Expr::OrE(b1, b2))
+        | (Expr::XorE(a1, a2), Expr::XorE(b1, b2))
+        | (Expr::ShlE(a1, a2), Expr::ShlE(b1, b2))
+        | (Expr::ShrE(a1, a2), Expr::ShrE(b1, b2)) => same_expr(a1, b1) && same_expr(a2, b2),
+        (Expr::Shl(a1, k1), Expr::Shl(b1, k2)) | (Expr::Shr(a1, k1), Expr::Shr(b1, k2)) => {
+            k1 == k2 && same_expr(a1, b1)
+        }
+        (Expr::And(a1, m1), Expr::And(b1, m2))
+        | (Expr::Or(a1, m1), Expr::Or(b1, m2))
+        | (Expr::Rem(a1, m1), Expr::Rem(b1, m2)) => m1 == m2 && same_expr(a1, b1),
+        _ => false,
+    }
+}
+
+/// Bitwise dominance: whether `a <= b` follows from the SHAPE of the two terms alone.
+///
+/// # Why this exists, and why it is not an interval fact
+///
+/// `x & y <= x` is a theorem of unsigned bitwise arithmetic for every `x` and `y` — clearing bits
+/// cannot increase a value. The interval domain cannot see it: over the full `u64` box both sides
+/// evaluate to `[0, u64::MAX]`, so [`cmp_le`] answers `Unknown`, exactly as it does for two
+/// unrelated variables. That is a *relational* fact about a shared operand, which is the same class
+/// of fact the affine fragment above recovers for `+`/`-` — and this is its bitwise counterpart.
+///
+/// The cost of not having it was concrete and was measured, not guessed: `Cap::attenuate` computes
+/// `rights & keep`, and the delegation argument "a child never holds a right the parent lacked" is
+/// exactly `(rights & keep) <= rights`. Lifted straight from the compiler's MIR, that property came
+/// back `Unknown` — so the induced-defect experiment could not even establish its own control, and a
+/// verdict that is `Unknown` for both the correct and the corrupted function distinguishes nothing.
+///
+/// # Soundness
+///
+/// Each rule is a theorem over all `u64` values, independent of any domain:
+///  * `x & y <= x` and `x & y <= y` — AND only clears bits.
+///  * `x <= x | y` and `y <= x | y` — OR only sets bits.
+///  * `x & m <= x` (constant mask) and `x <= x | m`.
+///  * `x >> k <= x` — a right shift never increases an unsigned value.
+///  * `x % m <= x` for `m != 0` — a remainder never exceeds its dividend.
+///  * `x <= x` — reflexivity.
+///
+/// Returning `false` is always safe: the caller falls back to the interval comparison.
+fn bitwise_dominates(small: &Expr, big: &Expr) -> bool {
+    if same_expr(small, big) {
+        return true; // x <= x
+    }
+    // Rules where the SMALLER side is the compound term.
+    match small {
+        // (x & y) <= x, and (x & y) <= y
+        Expr::AndE(x, y) => {
+            if bitwise_dominates(x, big) || bitwise_dominates(y, big) {
+                return true;
+            }
+        }
+        // (x & m) <= x
+        Expr::And(x, _) => {
+            if bitwise_dominates(x, big) {
+                return true;
+            }
+        }
+        // (x >> k) <= x
+        Expr::Shr(x, _) => {
+            if bitwise_dominates(x, big) {
+                return true;
+            }
+        }
+        // (x % m) <= x, for a non-zero modulus. `m == 0` is `Fault::DivByZero` territory and
+        // `eval_at` yields 0 there, so the rule would still hold — but it is excluded rather than
+        // relied upon, because the engine's two evaluators treat `% 0` differently and a law that
+        // depends on which one ran is not a law.
+        Expr::Rem(x, m) if *m != 0 && bitwise_dominates(x, big) => return true,
+        _ => {}
+    }
+    // Rules where the LARGER side is the compound term.
+    match big {
+        // x <= (x | y), and y <= (x | y)
+        Expr::OrE(x, y) => bitwise_dominates(small, x) || bitwise_dominates(small, y),
+        // x <= (x | m)
+        Expr::Or(x, _) => bitwise_dominates(small, x),
+        _ => false,
+    }
+}
+
+/// Structural equality of two propositions.
+///
+/// Conservative in the same way [`same_expr`] is: two propositions that are logically equivalent but
+/// written differently answer `false`. That costs precision (an honest `Unknown`) and never
+/// soundness.
+fn same_prop(a: &Prop, b: &Prop) -> bool {
+    match (a, b) {
+        (Prop::Le(a1, a2), Prop::Le(b1, b2))
+        | (Prop::Lt(a1, a2), Prop::Lt(b1, b2))
+        | (Prop::Ge(a1, a2), Prop::Ge(b1, b2))
+        | (Prop::Gt(a1, a2), Prop::Gt(b1, b2))
+        | (Prop::Eq(a1, a2), Prop::Eq(b1, b2))
+        | (Prop::Ne(a1, a2), Prop::Ne(b1, b2)) => same_expr(a1, b1) && same_expr(a2, b2),
+        (Prop::And(a1, a2), Prop::And(b1, b2))
+        | (Prop::Or(a1, a2), Prop::Or(b1, b2))
+        | (Prop::Implies(a1, a2), Prop::Implies(b1, b2)) => same_prop(a1, b1) && same_prop(a2, b2),
+        (Prop::Not(a1), Prop::Not(b1)) => same_prop(a1, b1),
+        _ => false,
+    }
+}
+
+/// Whether `p` syntactically entails `q` — i.e. `p -> q` holds in every model, decided from shape
+/// alone.
+///
+/// Two rules, both propositional tautologies:
+///  * `p -> p` (reflexivity).
+///  * `(a ∧ b) -> q` whenever `a` entails `q` or `b` entails `q` (conjunction elimination).
+///
+/// A `false` answer means "not decided here", and the caller falls back to the interval evaluation.
+fn entails(p: &Prop, q: &Prop) -> bool {
+    if same_prop(p, q) {
+        return true;
+    }
+    // Assuming a conjunction lets either conjunct discharge the goal — this is what makes a lifted
+    // goal decidable when the path guard is `a ∧ b` and the claim is one of them, which is the shape
+    // `LiftedFn::postcondition` produces for a nested branch.
+    if let Prop::And(a, b) = p {
+        if entails(a, q) || entails(b, q) {
+            return true;
+        }
+    }
+    // A conjunctive GOAL is discharged when every conjunct is.
+    if let Prop::And(a, b) = q {
+        return entails(p, a) && entails(p, b);
+    }
+    // WEAKENING: if `p` entails `q`, then `p` entails `a -> q` for ANY `a`, because a true
+    // consequent makes the implication true regardless of its antecedent.
+    //
+    // This is the rule the lifted goals actually need. `LiftedFn::postcondition` emits
+    // `guard -> claim(value)`, and a claim written as an implication (`result == 1 -> ...`, the
+    // natural way to state "whatever this function admits, the following holds") makes the goal
+    // `guard -> (antecedent -> guard)`. Without weakening the engine evaluates the inner `guard`
+    // against intervals independently of the outer one and answers `Unknown` — for the CORRECT
+    // function.
+    if let Prop::Implies(_, inner_q) = q {
+        if entails(p, inner_q) {
+            return true;
+        }
+    }
+    // And the dual on the left: `(a -> b)` entails `q` when `b` does AND `a` is discharged by `p`.
+    // Not attempted — it needs `p |= a`, which reintroduces the same undecidability this function
+    // exists to sidestep. Left as an honest gap rather than an unsound shortcut.
+    false
 }
 
 fn cmp_le_full(a: &Expr, b: &Expr, doms: &[Iv]) -> Tri {
@@ -471,6 +898,12 @@ fn cmp_le_full(a: &Expr, b: &Expr, doms: &[Iv]) -> Tri {
         if dlo > 0 {
             return Tri::False;
         }
+    }
+    // The bitwise counterpart of the affine rule above: a relational fact the interval domain loses.
+    // Checked AFTER affine (which can also return False) and BEFORE the interval fallback, and only
+    // ever able to turn an `Unknown` into a `True` — it never contradicts a decided answer.
+    if bitwise_dominates(a, b) {
+        return Tri::True;
     }
     cmp_le(a.eval_iv(doms), b.eval_iv(doms))
 }
@@ -527,6 +960,58 @@ fn cmp_eq(a: Iv, b: Iv) -> Tri {
     }
 }
 
+/// The interval every value of `e` is guaranteed to fall inside, when variable `i` ranges over
+/// `doms[i]` — the abstraction that every tier-5 verdict in this workspace is ultimately computed from.
+///
+/// # The contract, which is this crate's central claim
+///
+/// For **every** assignment `xs` with `doms[i].contains(xs[i])`, the concrete value of `e` at `xs`
+/// — ordinary wrapping `u64` arithmetic, as [`Expr`] documents — lies inside the returned interval.
+///
+/// The interval may be **wider** than the true value set. That costs precision and surfaces as
+/// [`SymVerdict::Unknown`], which is an honest answer. It must never be **narrower**: a missing value
+/// lets the three-valued comparison read `True` where the truth is mixed, and [`prove_forall_n`]
+/// returns `Proven` for a property that is false. Nothing downstream re-derives that verdict, so
+/// nothing downstream could catch it.
+///
+/// # Why this is public
+///
+/// Because until it was, the claim above could not be checked from outside the engine at all. The only
+/// way an under-approximation could be noticed was when it happened to *flip a comparison*, which
+/// requires the sample to contain both the faulty shape and an operand positioned to expose it — a
+/// detour that a plausible-looking sample misses silently. Exposing the interval turns the soundness
+/// lemma into something a proof can assert directly, at the point where it is actually violated.
+///
+/// ```
+/// use aion_verify::symbolic::{interval_of, Expr, Iv};
+///
+/// // x + 1 over x in [0, 10] can only be [1, 11].
+/// let iv = interval_of(&[Iv::new(0, 10)], &Expr::var().add(Expr::c(1)));
+/// assert_eq!((iv.lo, iv.hi), (1, 11));
+///
+/// // Widening is legal; narrowing is not. x - 1 over x in [0, 10] can wrap, so the abstraction
+/// // gives up the whole domain rather than reporting an interval that excludes u64::MAX.
+/// assert_eq!(interval_of(&[Iv::new(0, 10)], &Expr::var().sub(Expr::c(1))), Iv::full());
+/// ```
+/// True when any variable's domain is the empty set — see [`Iv::is_empty`] for what that costs.
+///
+/// The one place the answer is decided, so `interval_of` and the five `prove_*` entry points cannot
+/// drift apart on it.
+fn any_empty(doms: &[Iv]) -> bool {
+    doms.iter().any(Iv::is_empty)
+}
+
+pub fn interval_of(doms: &[Iv], e: &Expr) -> Iv {
+    // An empty box admits no assignment, so the containment lemma above is vacuously true of ANY
+    // returned interval — and the empty one is the only answer that is also true of the value SET.
+    // Returning it here rather than evaluating is not cosmetic: `Iv::shl` guards on `hi` and shifts
+    // `lo`, so evaluating over an inverted interval overflow-panics under `debug-assertions`.
+    if any_empty(doms) {
+        return Iv::empty();
+    }
+    e.eval_iv(doms)
+}
+
 /// The outcome of a tier-5 symbolic proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SymVerdict {
@@ -551,7 +1036,24 @@ pub fn prove_forall(domain: Iv, prop: &Prop) -> SymVerdict {
 /// Sound: a `Proven` result means the interval analysis established the property over a *superset* of
 /// the domain, so it holds for the domain itself. A `Refuted` result is always backed by a concrete
 /// assignment confirmed with wrapping arithmetic. Otherwise `Unknown`.
+/// # An empty domain is refused, not reasoned over
+///
+/// If any `doms[i]` [is empty](Iv::is_empty) the answer is [`SymVerdict::Unknown`]. Two other answers
+/// were available and both are worse. `Proven` is *technically* right — every property holds over a
+/// domain with no assignments in it — and is the single most dangerous verdict this engine can emit:
+/// a silent vacuous proof, with no `cases` figure to expose it the way [`crate::Verdict::is_vacuous`]
+/// exposes the tier-4 equivalent. `Refuted` is what the code did before, reporting `witness: [d.lo]`
+/// for a `d.lo` the domain excludes — a counterexample outside the domain it claims to be a
+/// counterexample in.
+///
+/// Normalising (swapping `lo` and `hi`, as [`Iv::new`] does) was rejected as well: `Iv::new` swaps
+/// because the caller stated an intent and got the order wrong, while a struct literal that reaches
+/// here has already escaped that check, and silently deciding which of the two bounds the caller
+/// meant is a guess the engine would then report as a proof.
 pub fn prove_forall_n(doms: &[Iv], prop: &Prop) -> SymVerdict {
+    if any_empty(doms) {
+        return SymVerdict::Unknown;
+    }
     match prop.eval_iv(doms) {
         Tri::True => SymVerdict::Proven,
         Tri::False => {
@@ -678,6 +1180,15 @@ pub fn prove_inductive(
     state_doms: &[Iv],
     max_splits: u32,
 ) -> SymVerdict {
+    // Both boxes are checked HERE rather than left to the calls below. `prove_forall_refine` would
+    // catch an empty `init_doms`, but an empty `state_doms` reaches `assume_narrow` first, which
+    // returns `None` for an unsatisfiable narrowing and which this function maps to `Proven` —
+    // "no state satisfies (invariant ∧ guard)". That mapping is right for a narrowing that emptied a
+    // real box and wrong for a box the caller handed over already empty, and the two are
+    // indistinguishable by the time `assume_narrow` answers.
+    if any_empty(init_doms) || any_empty(state_doms) {
+        return SymVerdict::Unknown;
+    }
     // 1. Initiation: the invariant holds in every initial state.
     let initiation = prove_forall_refine(init_doms, invariant, max_splits);
     if initiation != SymVerdict::Proven {
@@ -750,7 +1261,14 @@ fn probe(doms: &[Iv], prop: &Prop) -> SymVerdict {
 /// `max_splits` bounds the total number of bisections (protecting against blow-up); on exhaustion the
 /// undecided part is reported honestly as `Unknown`. A `Refuted` anywhere is a real counterexample for
 /// the whole domain; `Proven` requires every sub-box to be proven.
+/// An empty domain is refused here for the same reason as in [`prove_forall_n`], and with one extra:
+/// `refine` picks its split variable by the width `d.hi - d.lo`, which on an inverted interval
+/// underflow-**panics** under `debug-assertions` and wraps to a near-`u64::MAX` width in a release
+/// build. The engine did not merely answer wrongly on this input, it answered differently by profile.
 pub fn prove_forall_refine(doms: &[Iv], prop: &Prop, max_splits: u32) -> SymVerdict {
+    if any_empty(doms) {
+        return SymVerdict::Unknown;
+    }
     let mut budget = max_splits;
     refine(doms, prop, &mut budget)
 }
@@ -857,11 +1375,14 @@ impl Expr {
                     Ok(v << *k)
                 }
             }
-            Expr::Shr(a, k) => Ok(if *k >= 64 {
-                0
-            } else {
-                a.eval_checked(xs)? >> *k
-            }),
+            // Masked, matching [`Expr::eval_at`] and [`Iv::shr`]. There is no `Fault::ShrOverflow`:
+            // this crate models an over-wide RIGHT shift as the wrapping shift its concrete evaluator
+            // performs, not as a fault. (`Shl` is deliberately the other way — `Fault::ShlOverflow`
+            // documents `k >= 64` as a fault — because losing bits off the top destroys information
+            // and is worth reporting, while `x >> 64` under `wrapping_shr` is simply `x`.)
+            // Returning 0 here disagreed with `eval_at`, so a witness confirmed through this path
+            // was being confirmed against different semantics from the ones the engine reasons in.
+            Expr::Shr(a, k) => Ok(a.eval_checked(xs)? >> (*k % 64)),
             Expr::And(a, m) => Ok(a.eval_checked(xs)? & *m),
             Expr::Or(a, m) => Ok(a.eval_checked(xs)? | *m),
             Expr::Rem(a, m) => {
@@ -871,6 +1392,29 @@ impl Expr {
                 } else {
                     Ok(v % *m)
                 }
+            }
+            // Bitwise ops cannot fault: no operand value overflows, underflows, or divides.
+            Expr::AndE(a, b) => Ok(a.eval_checked(xs)? & b.eval_checked(xs)?),
+            Expr::OrE(a, b) => Ok(a.eval_checked(xs)? | b.eval_checked(xs)?),
+            Expr::XorE(a, b) => Ok(a.eval_checked(xs)? ^ b.eval_checked(xs)?),
+            // A variable LEFT shift can lose bits off the top, exactly as `Expr::Shl` can, and is
+            // reported as the same fault. Deliberately NOT silently wrapping here: `eval_checked`
+            // models debug-mode Rust, where `<<` by >= 64 panics, and a shift that discards
+            // information is worth reporting.
+            Expr::ShlE(a, b) => {
+                let v = a.eval_checked(xs)?;
+                let k = b.eval_checked(xs)?;
+                if k >= 64 || (k > 0 && v > (u64::MAX >> k)) {
+                    Err(Fault::ShlOverflow)
+                } else {
+                    Ok(v << k)
+                }
+            }
+            // A variable RIGHT shift is masked, matching `Expr::Shr` and `eval_at`. No fault.
+            Expr::ShrE(a, b) => {
+                let v = a.eval_checked(xs)?;
+                let k = b.eval_checked(xs)?;
+                Ok(v >> (k % 64))
             }
         }
     }
@@ -904,6 +1448,21 @@ impl Expr {
             }
             Expr::Shr(a, _) | Expr::And(a, _) | Expr::Or(a, _) => a.cannot_fault(doms),
             Expr::Rem(a, m) => a.cannot_fault(doms) && *m != 0,
+            // Bitwise ops and the masked right shift never fault themselves, so the answer is
+            // entirely about their operands.
+            Expr::AndE(a, b) | Expr::OrE(a, b) | Expr::XorE(a, b) | Expr::ShrE(a, b) => {
+                a.cannot_fault(doms) && b.cannot_fault(doms)
+            }
+            // A variable left shift is fault-free only when the shift amount is provably small
+            // enough that the value's maximum still fits. `hi >= 64` cannot be ruled out, so any
+            // domain reaching 64 answers `false` ("cannot rule it out"), never `true`.
+            Expr::ShlE(a, b) => {
+                let k = b.eval_iv(doms);
+                a.cannot_fault(doms)
+                    && b.cannot_fault(doms)
+                    && k.hi < 64
+                    && a.eval_iv(doms).hi <= (u64::MAX >> k.hi)
+            }
         }
     }
 }
@@ -963,6 +1522,12 @@ fn corner_assignments(doms: &[Iv]) -> Vec<Vec<u64>> {
 /// assert_eq!(prove_no_overflow(&[Iv::new(0, 1000)], &e), SymVerdict::Proven);
 /// ```
 pub fn prove_no_overflow(doms: &[Iv], e: &Expr) -> SymVerdict {
+    // Refused rather than answered, as in `prove_forall_n`. `cannot_fault` evaluates intervals, and
+    // `Iv::shl` overflow-panics on an inverted one; `corner_assignments` would then offer `d.lo` and
+    // `d.hi` as witnesses, neither of which the domain contains.
+    if any_empty(doms) {
+        return SymVerdict::Unknown;
+    }
     if e.cannot_fault(doms) {
         return SymVerdict::Proven;
     }

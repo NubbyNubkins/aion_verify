@@ -201,12 +201,62 @@ impl Ledger {
     }
 
     /// Record a proof result: a label and whether it was proven. Returns the new head hash.
+    ///
+    /// # The record must be READABLE, not merely distinct
+    ///
+    /// The payload is `(proven as 0x00 | 0x01) ‖ label`: **the flag first, at a fixed offset, and the
+    /// label taking the entire remainder.** Both halves of the pair are recoverable by
+    /// [`read_record`](Ledger::read_record) for *every* `label`, with no scan and no terminator.
+    ///
+    /// This layout is deliberate and the obvious one is wrong. The encoding here was previously
+    /// `label ‖ 0x00 ‖ flag` — a NUL-terminated label — and `label` is an arbitrary `&str`, which in
+    /// Rust may contain U+0000. A reader recovering the pair can only cut at the *first* terminator,
+    /// so a label with an embedded NUL made the reader take a byte out of the middle of the label as
+    /// the flag:
+    ///
+    /// ```text
+    ///   record("aion_storage::nothing_spins\0\x01", proven = FALSE)
+    ///     read back as  ("aion_storage::nothing_spins", proven = TRUE)
+    /// ```
+    ///
+    /// **A refutation read back as a proof**, and `record("x\0\0", true)` read back as refuted — the
+    /// corruption ran in both directions. Nothing detected it: [`verify`](Ledger::verify) confirms the
+    /// stored bytes are the bytes that were written, and they were. The chain protects the *transport*
+    /// of a record whose *meaning* was destroyed at the moment of writing, and a tamper-evident log of
+    /// unreadable records only proves that an unreadable thing was faithfully preserved.
+    ///
+    /// The check that existed compared *hashes* — `record(l, true)` hashing differently from
+    /// `record(l, false)` — which is injectivity, not readability. Both records can be distinct and
+    /// both decode to the same wrong flag; that is exactly what happened. Pinned by
+    /// `tests/ledger_format_proofs.rs` L1–L5.
+    ///
+    /// Length-prefixing the label was the alternative and was rejected as strictly more machinery for
+    /// the same guarantee: this payload is already delimited by the entry itself, so the label needs
+    /// no length — it is "the rest".
     pub fn record(&mut self, label: &str, proven: bool) -> [u8; HASH_LEN] {
-        let mut d = Vec::with_capacity(label.len() + 2);
-        d.extend_from_slice(label.as_bytes());
-        d.push(0);
+        let mut d = Vec::with_capacity(label.len() + 1);
         d.push(u8::from(proven));
+        d.extend_from_slice(label.as_bytes());
         self.append(&d)
+    }
+
+    /// Recover the `(label, proven)` pair from a payload written by [`record`](Ledger::record).
+    ///
+    /// The inverse of `record` for every `label`, including labels containing U+0000. `None` for an
+    /// empty payload, or one whose flag byte is neither `0` nor `1` — a payload from
+    /// [`append`](Ledger::append) is arbitrary bytes and is not a proof record, so it is refused
+    /// rather than guessed at.
+    ///
+    /// This exists so the format has a reader *in the same crate as its writer*. A wire format whose
+    /// only reader is prose is a format nothing can check, and the defect above is what that costs.
+    pub fn read_record(data: &[u8]) -> Option<(&str, bool)> {
+        let (&flag, rest) = data.split_first()?;
+        let proven = match flag {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some((core::str::from_utf8(rest).ok()?, proven))
     }
 
     /// Verify the chain is intact end to end. `Ok(())` means every entry's sequence, back-link, and
