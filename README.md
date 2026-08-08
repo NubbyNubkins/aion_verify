@@ -32,6 +32,12 @@ finite or bounded domain and get back either a proof (`Proven { cases }` — com
 - A real *proof* over the domain, not property-based fuzzing: if it says `Proven`, every input was checked.
 - Returns the counterexample on failure, so a red result is immediately actionable.
 
+> ## ⚠️ 3.9.0 fixes a soundness defect in 3.8.0 — upgrade if you use the `ledger` module
+>
+> **3.8.0 is live on crates.io and carries a defect our own internal proofs found after it was
+> published.** A crate whose entire claim is that it tells you the truth about code cannot be vague
+> about its own bugs, so here it is in full. See [What 3.9.0 fixes](#what-390-fixes-and-what-38-0-got-wrong).
+
 ## Why
 
 Property-based testing (proptest, quickcheck) *samples* an input space and can miss the one value that
@@ -43,6 +49,79 @@ cartesian product of a few slices — you can just check *all of it*, fast, in p
 
 It was built as the tier-4 engine of the AION OS verification stack, alongside Kani as the independent
 tier-5 formal check. It complements Kani; it does not replace it.
+
+## What 3.9.0 fixes, and what 3.8.0 got wrong
+
+3.8.0 was published, then found defective by our own internal proofs, and is superseded by 3.9.0. It
+has not been yanked and still works for everything outside the `ledger` module. Both problems below
+were caught by AION's own verification work after release — which is, if nothing else, the engine
+doing the job it exists for.
+
+### 1. A soundness defect in `ledger`: a refutation could read back as a proof
+
+**This is the most serious class of bug a verification tool can have.** In 3.8.0, `Ledger::record`
+encoded the pair `(label, proven)` as `label ‖ 0x00 ‖ flag` — a NUL-terminated label. But `label` is
+an arbitrary `&str`, and **a Rust `&str` may contain U+0000.** Any reader recovering the pair can
+only cut at the *first* terminator, so a label with an embedded NUL made the reader take a byte out
+of the middle of the label and treat it as the flag:
+
+```text
+  3.8.0:  record("aion_storage::nothing_spins\0\x01", proven = FALSE)
+          reads back as ("aion_storage::nothing_spins", proven = TRUE)
+```
+
+A **refutation read back as a proof** — and `record("x\0\0", true)` read back as refuted, so the
+corruption ran in both directions and the safe direction was not the default.
+
+**Nothing detected it, and the hash chain is why it looked fine.** `Ledger::verify()` confirms the
+stored bytes are the bytes that were written, and they were: no tampering occurred. The chain
+protected the *transport* of a record whose *meaning* was destroyed at the moment of writing. A
+tamper-evident log of unreadable records only proves that an unreadable thing was faithfully
+preserved.
+
+The one check that existed compared **hashes** — `record(l, true)` hashing differently from
+`record(l, false)`. That is *injectivity*, not *readability*: two payloads can hash differently while
+both decode to the same wrong flag, which is exactly what happened.
+
+The deeper cause is a format that **had no reader at all**. The writer and the meaning of its bytes
+were joined only by prose, and a format nothing reads is never forced to be readable.
+
+**Fixed in 3.9.0.** The payload is now `flag ‖ label` — flag first at a fixed offset, label the
+entire remainder. Both halves are recoverable for *every* label, with no scan and no terminator. And
+`Ledger::read_record` now exists, so **the format has a reader in the same crate as its writer**,
+with `tests/ledger_proofs.rs` pinning the round trip. `read_record` returns `None` for a flag byte
+outside `{0, 1}` rather than guessing, because a payload from `append` is arbitrary bytes and is not
+a proof record.
+
+### 2. The tests that prove the engine's best claim were never shipped
+
+To be precise, because the sloppy version of this claim is wrong: **3.8.0's test suite does compile
+and pass for a downloader — 76 of 76.** The problem is what it does *not* contain.
+
+The two tests where the engine proves **another crate's** invariants — the whole point of a proof
+engine — reasoned about a private crate reached as a **`path` dev-dependency**. `cargo publish`
+strips path-only dev-dependencies, so those two files could never be shipped in a form anyone could
+compile. Every published version to date therefore demonstrated the engine only against itself, and
+an engine checking a predicate it also defined proves only that it agrees with itself.
+
+**Fixed in 3.9.0** by publishing the subject: see
+[Proving *another crate's* invariants](#proving-another-crates-invariants--and-running-that-proof-yourself).
+`tests/connection.rs` and `tests/grouping.rs` now ship, resolve, and run for everybody — **79 of 79
+tests pass from the unpacked `.crate` artifact**, in a directory with no sibling paths to fall back
+on.
+
+### 3. Also in 3.9.0
+
+- **The interval domain gains bitwise and shift transfer functions** (`and_e`, `or_e`, `xor_e`,
+  `shl_e`, `shr_e`, plus precise `>>` on intervals). `(x >> 1) <= x` over all 2^64 values of `u64` is
+  now decided outright by the plain interval domain, where 3.8.0 returned `Unknown`.
+- **The `safety` module now measures the half of itself it previously did not.**
+- Three symbolic tests were **re-aimed, not relaxed**: they used to assert `Unknown` for the shift
+  property above. Left alone they would have gone red; edited to expect `Proven` they would have
+  stopped testing soundness at all. They now state the same claims about `x * x >= x` over
+  `[0, 1000]` — true everywhere in the domain, and genuinely undecidable by a non-relational domain,
+  which treats the two occurrences of `x` as independent. The old property is kept as a test in its
+  own right so the improvement is pinned rather than lost.
 
 ## Example
 
@@ -169,7 +248,7 @@ access-control domain (badges, roles, clearances, wings, revocation) that has **
 including no dependency on `aion_verify`**. The arrow runs one way only.
 
 ```console
-$ cargo test --test connection --test grouping
+cargo test --test connection --test grouping
 ```
 
 Four invariants, each by complete coverage rather than sampling:

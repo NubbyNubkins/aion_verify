@@ -101,3 +101,94 @@ fn a_diverged_head_proves_rewriting_against_an_anchor() {
         "any rewrite diverges from the anchored head"
     );
 }
+
+// ── P6 — the record is READABLE, not merely distinct (the 3.8.0 soundness defect) ─────────────────
+//
+// Until 3.9.0, `record` encoded `(label, proven)` as `label ‖ 0x00 ‖ flag`. A Rust `&str` may contain
+// U+0000, so any reader had to cut at the FIRST terminator and took a byte out of the middle of the
+// label as the flag: `record("...spins\0\x01", proven = false)` read back as `proven = true`. A
+// REFUTATION READ BACK AS A PROOF, and the corruption ran both ways.
+//
+// Nothing caught it. `verify()` confirms the stored bytes are the bytes written, and they were — the
+// chain protected the TRANSPORT of a record whose MEANING was destroyed at the moment of writing. The
+// one check that existed compared HASHES, which is injectivity, not readability: two payloads can hash
+// differently and both decode to the same wrong flag. That is exactly what happened.
+//
+// So the property below is deliberately about READABILITY and not about distinctness, and its domain
+// deliberately contains embedded NULs and the empty label — the inputs the old encoding died on.
+
+/// Labels chosen so the proof cannot pass by avoiding the hard cases. Three contain U+0000, one is
+/// empty, one is a lone NUL; both counts are asserted below so the domain cannot silently narrow.
+const LABELS: [&str; 8] = [
+    "aion_storage::nothing_spins",
+    "aion_storage::nothing_spins\u{0}\u{1}", // the original counterexample
+    "x\u{0}\u{0}",                           // corruption in the other direction
+    "\u{0}",                                 // a label that is nothing but a terminator
+    "",                                      // the empty label
+    "a",
+    "unicode ✓ label",
+    "a::b::c::very_long_label_with_no_terminator_at_all",
+];
+
+#[test]
+fn p6_every_record_reads_back_as_exactly_what_was_written() {
+    // The domain must actually contain the hard cases, or "it round-trips" is a claim about easy input.
+    assert_eq!(LABELS.iter().filter(|l| l.contains('\u{0}')).count(), 3);
+    assert_eq!(LABELS.iter().filter(|l| l.is_empty()).count(), 1);
+
+    let v = aion_verify::for_all_pairs(&LABELS, &[true, false], |&label, &proven| {
+        let mut l = Ledger::new();
+        l.record(label, proven);
+        match Ledger::read_record(&l.entries()[0].data) {
+            Some((back, flag)) => back == label && flag == proven,
+            None => false,
+        }
+    });
+    assert!(
+        v.is_proven(),
+        "a record did not read back as written: {:?}",
+        v.counterexample()
+    );
+    assert_eq!(
+        v.cases(),
+        (LABELS.len() * 2) as u64,
+        "16 cases, all of them"
+    );
+}
+
+#[test]
+fn p6_the_flag_survives_independently_of_the_label() {
+    // The specific 3.8.0 failure, stated as its own claim: the SAME label recorded both ways must read
+    // back both ways. Under the old encoding this failed for every label containing U+0000.
+    let v = aion_verify::for_all(LABELS, |&label| {
+        let mut t = Ledger::new();
+        t.record(label, true);
+        let mut f = Ledger::new();
+        f.record(label, false);
+        let (lt, pt) = Ledger::read_record(&t.entries()[0].data).unwrap();
+        let (lf, pf) = Ledger::read_record(&f.entries()[0].data).unwrap();
+        lt == label && lf == label && pt && !pf
+    });
+    assert!(v.is_proven(), "flag lost: {:?}", v.counterexample());
+    assert_eq!(v.cases(), LABELS.len() as u64);
+}
+
+#[test]
+fn p6_a_non_record_payload_is_refused_rather_than_guessed_at() {
+    // `append` takes arbitrary bytes, which are not a proof record. Every flag byte outside {0,1} must
+    // be refused — all 254 of them, not a sample — and an empty payload too.
+    let v = aion_verify::for_all_u8(|b| {
+        if b <= 1 {
+            return true; // a valid flag; covered by the proofs above
+        }
+        let mut l = Ledger::new();
+        l.append(&[b, b'x']);
+        Ledger::read_record(&l.entries()[0].data).is_none()
+    });
+    assert!(v.is_proven(), "guessed at a flag: {:?}", v.counterexample());
+    assert_eq!(v.cases(), 256);
+
+    let mut empty = Ledger::new();
+    empty.append(&[]);
+    assert!(Ledger::read_record(&empty.entries()[0].data).is_none());
+}
